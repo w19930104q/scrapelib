@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- add opt-in `stream_cache` mode for caching streamed responses without
+  reading the body up-front (supported by `FileCache` and `SQLiteCache`);
+  entries are only published once the body is read to EOF, early close and
+  transport/write failures preserve any previous entry, cache hits support
+  chunked and interleaved reads, decoded bodies are stored so gzip is not
+  applied twice on replay, and cache read/write buffers stay bounded
+
 ## 2.4.1
 
 **1 July 2025**

@@ -25,6 +25,8 @@ from .cache import (  # noqa
     SQLiteCache,
     MemoryCache,
     CacheResponse,
+    _TeeRaw,
+    _CachedBodyRaw,
 )
 from ._types import (
     _Data,
@@ -318,6 +320,14 @@ class CachingSession(ThrottledSession):
         super().__init__()
         self.cache_storage = cache_storage
         self.cache_write_only = False
+        # Opt-in streaming cache mode.  When True, a streamed request
+        # (stream=True) is cached without reading the body up-front: the
+        # response body is teed into the storage as iter_content/content/
+        # text consume it, and the entry is only published once EOF is
+        # reached.  Requires a backend with supports_streaming=True
+        # (FileCache or SQLiteCache); off by default so all existing
+        # behavior is unchanged.
+        self.stream_cache = False
 
     def key_for_request(
         self,
@@ -396,6 +406,34 @@ class CachingSession(ThrottledSession):
             resp.fromcache = False
             return resp
 
+        # streaming mode requires a backend that can spool/replay bodies
+        # without materializing them
+        if self.stream_cache and stream:
+            if not getattr(self.cache_storage, "supports_streaming", False):
+                raise TypeError(
+                    "stream_cache is enabled but %r does not support "
+                    "streaming caching (use FileCache or SQLiteCache)"
+                    % type(self.cache_storage).__name__
+                )
+            return self._streaming_request(
+                method,
+                url,
+                params=params,
+                data=data,
+                headers=headers,
+                cookies=cookies,
+                files=files,
+                auth=auth,
+                timeout=timeout,
+                allow_redirects=allow_redirects,
+                proxies=proxies,
+                hooks=hooks,
+                verify=verify,
+                cert=cert,
+                json=json,
+                retry_on_404=retry_on_404,
+            )
+
         method = method.lower()
 
         request_key = self.key_for_request(method, url, params, data)
@@ -433,6 +471,83 @@ class CachingSession(ThrottledSession):
             resp = cast(CacheResponse, resp)
             resp.fromcache = False
 
+        return resp
+
+    def _streaming_request(
+        self,
+        method: str,
+        url: Union[str, bytes, Text],
+        params: Union[None, bytes, MutableMapping[Text, Text]] = None,
+        data: _Data = None,
+        headers: Optional[MutableMapping[Text, Text]] = None,
+        cookies: Union[None, RequestsCookieJar, MutableMapping[Text, Text]] = None,
+        files: Optional[MutableMapping[Text, IO[Any]]] = None,
+        auth: _AuthType = None,
+        timeout: Union[None, float, Tuple[float, float], Tuple[float, None]] = None,
+        allow_redirects: Optional[bool] = True,
+        proxies: Optional[MutableMapping[Text, Text]] = None,
+        hooks: Optional[_HooksInput] = None,
+        verify: Union[None, bool, Text] = None,
+        cert: Union[Text, Tuple[Text, Text], None] = None,
+        json: Optional[Any] = None,
+        retry_on_404: bool = False,
+    ) -> CacheResponse:
+        """Caching path for streamed requests.
+
+        The body is never read up-front: on a cache miss the response's raw
+        stream is wrapped so that chunks consumed via iter_content/content/
+        text are spooled into a sink and the entry is only published once
+        EOF is reached; a cache hit is replayed through another bounded
+        raw stream.
+        """
+        storage = cast(CacheStorageBase, self.cache_storage)
+        method = method.lower()
+        request_key = self.key_for_request(method, url, params, data)
+
+        stream_entry = None
+        if request_key and not self.cache_write_only:
+            stream_entry = storage.stream_get(request_key)
+
+        if stream_entry is not None:
+            cached, body_stream = stream_entry
+            cached.raw = cast(Any, _CachedBodyRaw(body_stream))
+            cached._content = cast(Any, False)
+            setattr(cached, "_content_consumed", False)
+            resp = cast(CacheResponse, cached)
+            resp.fromcache = True
+            return resp
+
+        resp = cast(
+            CacheResponse,
+            super().request(
+                method,
+                url,
+                data=data,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                files=files,
+                auth=auth,
+                timeout=timeout,
+                allow_redirects=allow_redirects,
+                proxies=proxies,
+                hooks=hooks,
+                stream=True,
+                verify=verify,
+                cert=cert,
+                json=json,
+                retry_on_404=retry_on_404,
+            ),
+        )
+
+        # tee the body into the cache as it is consumed, publishing only
+        # after a complete read
+        if request_key and self.should_cache_response(resp):
+            sink = storage.stream_set(request_key, resp)
+            resp.raw = cast(Any, _TeeRaw(resp.raw, sink))
+
+        resp = cast(CacheResponse, resp)
+        resp.fromcache = False
         return resp
 
 
@@ -499,6 +614,7 @@ class Scraper(CachingSession):
         # added by CachingSession
         self.cache_storage = None
         self.cache_write_only = True
+        self.stream_cache = False
 
         # non-parameter options
         self.timeout: Optional[float] = None
